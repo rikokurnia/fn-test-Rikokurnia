@@ -103,4 +103,58 @@ describe("solana_crowdfunding", () => {
       expect(e.error.errorMessage).to.equal("Funds already claimed.");
     }
   });
+
+  describe("Refund Scenarios (Campaign 2)", () => {
+    let campaign2PDA: anchor.web3.PublicKey;
+    let receipt1_2PDA: anchor.web3.PublicKey;
+
+    it("7. Create a new campaign for refund test (high goal)", async () => {
+      const creator2 = anchor.web3.Keypair.generate();
+      const sig = await provider.connection.requestAirdrop(creator2.publicKey, 10 * 10 ** 9);
+      await provider.connection.confirmTransaction(sig);
+
+      [campaign2PDA] = anchor.web3.PublicKey.findProgramAddressSync(
+        [Buffer.from("campaign"), creator2.publicKey.toBuffer()],
+        program.programId
+      );
+
+      [receipt1_2PDA] = anchor.web3.PublicKey.findProgramAddressSync(
+        [Buffer.from("receipt"), campaign2PDA.toBuffer(), donor1.publicKey.toBuffer()],
+        program.programId
+      );
+
+      const goal = new anchor.BN(5000 * 10 ** 9);
+      const now = Math.floor(Date.now() / 1000);
+      const deadline = new anchor.BN(now + 2);
+
+      await program.methods.createCampaign(goal, deadline)
+        .accounts({ creator: creator2.publicKey })
+        .signers([creator2]).rpc();
+    });
+
+    it("8. Contribute 100 SOL (not enough for goal)", async () => {
+      const amount = new anchor.BN(100 * 10 ** 9);
+      await program.methods.contribute(amount)
+        .accounts({ donor: donor1.publicKey, campaign: campaign2PDA, receipt: receipt1_2PDA })
+        .signers([donor1]).rpc();
+    });
+
+    it("9. Wait for deadline and claim refund", async () => {
+      console.log("      (Waiting 3 seconds to simulate deadline passing...)");
+      await new Promise((r) => setTimeout(r, 3000));
+
+      const donorBalanceBefore = await provider.connection.getBalance(donor1.publicKey);
+      
+      await program.methods.refund()
+        .accounts({ donor: donor1.publicKey, campaign: campaign2PDA, receipt: receipt1_2PDA })
+        .signers([donor1]).rpc();
+
+      const donorBalanceAfter = await provider.connection.getBalance(donor1.publicKey);
+      expect(donorBalanceAfter).to.be.greaterThan(donorBalanceBefore);
+
+      const receipt = await program.account.receipt.fetch(receipt1_2PDA);
+      expect(receipt.amount.toNumber()).to.equal(0);
+    });
+  });
+
 });

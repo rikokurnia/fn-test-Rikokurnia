@@ -7,11 +7,17 @@ declare_id!("4g55JHQDi9diLma9XsAwhdBNSkuEVBK9vNExEMPmcUTK");
 pub mod solana_crowdfunding {
     use super::*;
 
+    /// Creates a new crowdfunding campaign.
+    ///
+    /// * `goal` - Target amount in lamports.
+    /// * `deadline` - Unix timestamp when the campaign ends.
     pub fn create_campaign(ctx: Context<CreateCampaign>, goal: u64, deadline: i64) -> Result<()> {
         let campaign = &mut ctx.accounts.campaign;
         let clock = Clock::get()?;
 
-        // Validasi: Deadline harus di masa depan
+        // Ensure the goal is at least some amount
+        require!(goal > 0, CrowdError::InvalidGoal);
+        // Validate: Deadline must be in the future
         require!(deadline > clock.unix_timestamp, CrowdError::InvalidDeadline);
 
         campaign.creator = ctx.accounts.creator.key();
@@ -25,26 +31,29 @@ pub mod solana_crowdfunding {
         Ok(())
     }
 
+    /// Allows a user to contribute SOL to a specific campaign.
+    ///
+    /// * `amount` - Amount to contribute in lamports.
     pub fn contribute(ctx: Context<Contribute>, amount: u64) -> Result<()> {
         let campaign = &mut ctx.accounts.campaign;
         let receipt = &mut ctx.accounts.receipt;
         let clock = Clock::get()?;
 
-        // Validasi: Tidak bisa donasi jika waktu sudah habis
+        // Validate: Contribution only allowed while campaign is active
         require!(clock.unix_timestamp < campaign.deadline, CrowdError::CampaignEnded);
 
-        // Inisialisasi data kwitansi jika ini donasi pertama dari donor ini
+        // Initialize receipt data if this is the first contribution from this donor
         if receipt.amount == 0 {
             receipt.donor = ctx.accounts.donor.key();
             receipt.campaign = campaign.key();
             receipt.bump = ctx.bumps.receipt;
         }
 
-        // Catat donasi
+        // Record contribution
         receipt.amount += amount;
         campaign.raised += amount;
 
-        // Transfer SOL dari Donor ke PDA Campaign (Vault)
+        // Transfer SOL from Donor to Campaign PDA (Vault)
         let cpi_ctx = CpiContext::new(
             ctx.accounts.system_program.to_account_info(),
             system_program::Transfer {
@@ -54,15 +63,16 @@ pub mod solana_crowdfunding {
         );
         system_program::transfer(cpi_ctx, amount)?;
 
-        msg!("Contributed: {} lamports, total={}", amount, campaign.raised);
+        msg!("Contributed: {} lamports, total raised={}", amount, campaign.raised);
         Ok(())
     }
 
+    /// Allows the campaign creator to withdraw funds if the goal was met and the deadline passed.
     pub fn withdraw(ctx: Context<Withdraw>) -> Result<()> {
         let campaign = &mut ctx.accounts.campaign;
         let clock = Clock::get()?;
 
-        // Syarat Withdraw Mutlak
+        // Withdrawal requirements
         require!(campaign.raised >= campaign.goal, CrowdError::GoalNotMet);
         require!(clock.unix_timestamp >= campaign.deadline, CrowdError::CampaignActive);
         require!(!campaign.claimed, CrowdError::AlreadyClaimed);
@@ -70,7 +80,7 @@ pub mod solana_crowdfunding {
         campaign.claimed = true;
         let amount = campaign.raised;
 
-        // Transfer SOL dari PDA Vault kembali ke Creator
+        // Transfer SOL from Campaign PDA Vault back to Creator
         **campaign.to_account_info().try_borrow_mut_lamports()? -= amount;
         **ctx.accounts.creator.to_account_info().try_borrow_mut_lamports()? += amount;
 
@@ -78,20 +88,21 @@ pub mod solana_crowdfunding {
         Ok(())
     }
 
+    /// Allows donors to claim a refund if the campaign failed to reach its goal by the deadline.
     pub fn refund(ctx: Context<Refund>) -> Result<()> {
         let campaign = &ctx.accounts.campaign;
         let receipt = &mut ctx.accounts.receipt;
         let clock = Clock::get()?;
 
-        // Syarat Refund Mutlak
+        // Refund requirements
         require!(campaign.raised < campaign.goal, CrowdError::GoalMet);
         require!(clock.unix_timestamp >= campaign.deadline, CrowdError::CampaignActive);
         require!(receipt.amount > 0, CrowdError::NoContribution);
 
         let amount = receipt.amount;
-        receipt.amount = 0; // Cegah double refund
+        receipt.amount = 0; // Guard against re-entrancy / double refund
 
-        // Transfer SOL dari PDA Vault kembali ke Donor
+        // Transfer SOL from Campaign PDA Vault back to Donor
         **campaign.to_account_info().try_borrow_mut_lamports()? -= amount;
         **ctx.accounts.donor.to_account_info().try_borrow_mut_lamports()? += amount;
 
@@ -161,26 +172,40 @@ pub struct Refund<'info> {
     pub receipt: Account<'info, Receipt>,
 }
 
+/// Metadata and state of a single crowdfunding campaign.
 #[account]
 pub struct Campaign {
+    /// Public key of the campaign creator.
     pub creator: Pubkey,
+    /// Targeted amount to raise in lamports.
     pub goal: u64,
+    /// Total amount currently raised in lamports.
     pub raised: u64,
+    /// Unix timestamp when the campaign expires.
     pub deadline: i64,
+    /// Whether the funds have been successfully claimed by the creator.
     pub claimed: bool,
+    /// Bump seed for PDA.
     pub bump: u8,
 }
 
+/// Record of an individual donor's contribution to a specific campaign.
 #[account]
 pub struct Receipt {
+    /// Public key of the campaign account.
     pub campaign: Pubkey,
+    /// Public key of the donor.
     pub donor: Pubkey,
+    /// Total amount contributed by this donor in lamports.
     pub amount: u64,
+    /// Bump seed for PDA.
     pub bump: u8,
 }
 
 #[error_code]
 pub enum CrowdError {
+    #[msg("Goal must be greater than 0.")]
+    InvalidGoal,
     #[msg("Deadline must be in the future.")]
     InvalidDeadline,
     #[msg("Campaign deadline has passed.")]
