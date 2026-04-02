@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_lang::system_program;
+use anchor_lang::solana_program::{system_instruction, program::invoke_signed};
 
 declare_id!("4g55JHQDi9diLma9XsAwhdBNSkuEVBK9vNExEMPmcUTK");
 
@@ -7,72 +7,74 @@ declare_id!("4g55JHQDi9diLma9XsAwhdBNSkuEVBK9vNExEMPmcUTK");
 pub mod solana_crowdfunding {
     use super::*;
 
-    /// Creates a new crowdfunding campaign.
-    ///
-    /// * `goal` - Target amount in lamports.
-    /// * `deadline` - Unix timestamp when the campaign ends.
+    /// 1. Create Campaign
+    /// What it does: Creator sets up a new fundraising campaign
     pub fn create_campaign(ctx: Context<CreateCampaign>, goal: u64, deadline: i64) -> Result<()> {
         let campaign = &mut ctx.accounts.campaign;
         let clock = Clock::get()?;
 
-        // Ensure the goal is at least some amount
-        require!(goal > 0, CrowdError::InvalidGoal);
-        // Validate: Deadline must be in the future
+        // Validate deadline is in the future
         require!(deadline > clock.unix_timestamp, CrowdError::InvalidDeadline);
+        // Ensure goal is positive
+        require!(goal > 0, CrowdError::InvalidGoal);
 
+        // Store campaign data
         campaign.creator = ctx.accounts.creator.key();
         campaign.goal = goal;
         campaign.raised = 0;
         campaign.deadline = deadline;
         campaign.claimed = false;
-        campaign.bump = ctx.bumps.campaign;
 
         msg!("Campaign created: goal={}, deadline={}", goal, deadline);
         Ok(())
     }
 
-    /// Allows a user to contribute SOL to a specific campaign.
-    ///
-    /// * `amount` - Amount to contribute in lamports.
+    /// 2. Contribute
+    /// What it does: Donor sends SOL to the campaign vault (PDA)
     pub fn contribute(ctx: Context<Contribute>, amount: u64) -> Result<()> {
         let campaign = &mut ctx.accounts.campaign;
-        let receipt = &mut ctx.accounts.receipt;
         let clock = Clock::get()?;
 
-        // Validate: Contribution only allowed while campaign is active
+        // Validate contribution only while campaign is active
         require!(clock.unix_timestamp < campaign.deadline, CrowdError::CampaignEnded);
 
-        // Initialize receipt data if this is the first contribution from this donor
+        // Update campaign raised amount
+        campaign.raised += amount;
+
+        // Track individual donor's contribution for refunds
+        let receipt = &mut ctx.accounts.receipt;
         if receipt.amount == 0 {
             receipt.donor = ctx.accounts.donor.key();
             receipt.campaign = campaign.key();
-            receipt.bump = ctx.bumps.receipt;
         }
-
-        // Record contribution
         receipt.amount += amount;
-        campaign.raised += amount;
 
-        // Transfer SOL from Donor to Campaign PDA (Vault)
-        let cpi_ctx = CpiContext::new(
-            ctx.accounts.system_program.to_account_info(),
-            system_program::Transfer {
-                from: ctx.accounts.donor.to_account_info(),
-                to: campaign.to_account_info(),
-            }
+        // Transfer SOL from donor to campaign vault (PDA)
+        let ix = system_instruction::transfer(
+            &ctx.accounts.donor.key(),
+            &ctx.accounts.vault.key(),
+            amount,
         );
-        system_program::transfer(cpi_ctx, amount)?;
+        anchor_lang::solana_program::program::invoke(
+            &ix,
+            &[
+                ctx.accounts.donor.to_account_info(),
+                ctx.accounts.vault.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+        )?;
 
-        msg!("Contributed: {} lamports, total raised={}", amount, campaign.raised);
+        msg!("Contributed: {} lamports, total={}", amount, campaign.raised);
         Ok(())
     }
 
-    /// Allows the campaign creator to withdraw funds if the goal was met and the deadline passed.
+    /// 3. Withdraw
+    /// What it does: Creator claims funds if campaign succeeded
     pub fn withdraw(ctx: Context<Withdraw>) -> Result<()> {
         let campaign = &mut ctx.accounts.campaign;
         let clock = Clock::get()?;
 
-        // Withdrawal requirements
+        // Conditions: Goal met, Deadline passed, Caller is creator, Not already claimed
         require!(campaign.raised >= campaign.goal, CrowdError::GoalNotMet);
         require!(clock.unix_timestamp >= campaign.deadline, CrowdError::CampaignActive);
         require!(!campaign.claimed, CrowdError::AlreadyClaimed);
@@ -80,31 +82,66 @@ pub mod solana_crowdfunding {
         campaign.claimed = true;
         let amount = campaign.raised;
 
-        // Transfer SOL from Campaign PDA Vault back to Creator
-        **campaign.to_account_info().try_borrow_mut_lamports()? -= amount;
-        **ctx.accounts.creator.to_account_info().try_borrow_mut_lamports()? += amount;
+        // Transfer all SOL from vault to creator using invoke_signed
+        let campaign_key = campaign.key();
+        let seeds = &[b"vault", campaign_key.as_ref(), &[ctx.bumps.vault]];
+        let signer_seeds = &[&seeds[..]];
+
+        let ix = system_instruction::transfer(
+            &ctx.accounts.vault.key(),
+            &ctx.accounts.creator.key(),
+            amount,
+        );
+
+        invoke_signed(
+            &ix,
+            &[
+                ctx.accounts.vault.to_account_info(),
+                ctx.accounts.creator.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+            signer_seeds,
+        )?;
 
         msg!("Withdrawn: {} lamports", amount);
         Ok(())
     }
 
-    /// Allows donors to claim a refund if the campaign failed to reach its goal by the deadline.
+    /// 4. Refund
+    /// What it does: Donor gets money back if campaign failed
     pub fn refund(ctx: Context<Refund>) -> Result<()> {
         let campaign = &ctx.accounts.campaign;
         let receipt = &mut ctx.accounts.receipt;
         let clock = Clock::get()?;
 
-        // Refund requirements
+        // Conditions: Goal NOT met, Deadline passed
         require!(campaign.raised < campaign.goal, CrowdError::GoalMet);
         require!(clock.unix_timestamp >= campaign.deadline, CrowdError::CampaignActive);
         require!(receipt.amount > 0, CrowdError::NoContribution);
 
         let amount = receipt.amount;
-        receipt.amount = 0; // Guard against re-entrancy / double refund
+        receipt.amount = 0; // Prevent double refund
 
-        // Transfer SOL from Campaign PDA Vault back to Donor
-        **campaign.to_account_info().try_borrow_mut_lamports()? -= amount;
-        **ctx.accounts.donor.to_account_info().try_borrow_mut_lamports()? += amount;
+        // Transfer donor's contribution back from vault using invoke_signed
+        let campaign_key = campaign.key();
+        let seeds = &[b"vault", campaign_key.as_ref(), &[ctx.bumps.vault]];
+        let signer_seeds = &[&seeds[..]];
+
+        let ix = system_instruction::transfer(
+            &ctx.accounts.vault.key(),
+            &ctx.accounts.donor.key(),
+            amount,
+        );
+
+        invoke_signed(
+            &ix,
+            &[
+                ctx.accounts.vault.to_account_info(),
+                ctx.accounts.donor.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+            signer_seeds,
+        )?;
 
         msg!("Refunded: {} lamports", amount);
         Ok(())
@@ -118,7 +155,7 @@ pub struct CreateCampaign<'info> {
     #[account(
         init,
         payer = creator,
-        space = 8 + 32 + 8 + 8 + 8 + 1 + 1, // Space untuk struct Campaign
+        space = 8 + 32 + 8 + 8 + 8 + 1, // Corrected Campaign space
         seeds = [b"campaign", creator.key().as_ref()],
         bump
     )]
@@ -132,10 +169,17 @@ pub struct Contribute<'info> {
     pub donor: Signer<'info>,
     #[account(mut)]
     pub campaign: Account<'info, Campaign>,
+    /// CHECK: This is a PDA used as a SOL vault. It's a simple system account.
+    #[account(
+        mut,
+        seeds = [b"vault", campaign.key().as_ref()],
+        bump
+    )]
+    pub vault: UncheckedAccount<'info>,
     #[account(
         init_if_needed,
         payer = donor,
-        space = 8 + 32 + 32 + 8 + 1, // Space untuk struct Receipt
+        space = 8 + 32 + 32 + 8, // Corrected Receipt space
         seeds = [b"receipt", campaign.key().as_ref(), donor.key().as_ref()],
         bump
     )]
@@ -151,9 +195,17 @@ pub struct Withdraw<'info> {
         mut,
         has_one = creator,
         seeds = [b"campaign", creator.key().as_ref()],
-        bump = campaign.bump
+        bump
     )]
     pub campaign: Account<'info, Campaign>,
+    /// CHECK: This is the SOL vault for the campaign.
+    #[account(
+        mut,
+        seeds = [b"vault", campaign.key().as_ref()],
+        bump
+    )]
+    pub vault: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
@@ -162,44 +214,38 @@ pub struct Refund<'info> {
     pub donor: Signer<'info>,
     #[account(mut)]
     pub campaign: Account<'info, Campaign>,
+    /// CHECK: This is the SOL vault for the campaign.
+    #[account(
+        mut,
+        seeds = [b"vault", campaign.key().as_ref()],
+        bump
+    )]
+    pub vault: UncheckedAccount<'info>,
     #[account(
         mut,
         has_one = donor,
         has_one = campaign,
         seeds = [b"receipt", campaign.key().as_ref(), donor.key().as_ref()],
-        bump = receipt.bump
+        bump
     )]
     pub receipt: Account<'info, Receipt>,
+    pub system_program: Program<'info, System>,
 }
 
-/// Metadata and state of a single crowdfunding campaign.
 #[account]
 pub struct Campaign {
-    /// Public key of the campaign creator.
-    pub creator: Pubkey,
-    /// Targeted amount to raise in lamports.
-    pub goal: u64,
-    /// Total amount currently raised in lamports.
-    pub raised: u64,
-    /// Unix timestamp when the campaign expires.
-    pub deadline: i64,
-    /// Whether the funds have been successfully claimed by the creator.
-    pub claimed: bool,
-    /// Bump seed for PDA.
-    pub bump: u8,
+    pub creator: Pubkey,    // Who created this
+    pub goal: u64,          // Target amount
+    pub raised: u64,        // Current amount
+    pub deadline: i64,      // When it expires
+    pub claimed: bool,      // Already withdrawn?
 }
 
-/// Record of an individual donor's contribution to a specific campaign.
 #[account]
 pub struct Receipt {
-    /// Public key of the campaign account.
     pub campaign: Pubkey,
-    /// Public key of the donor.
     pub donor: Pubkey,
-    /// Total amount contributed by this donor in lamports.
     pub amount: u64,
-    /// Bump seed for PDA.
-    pub bump: u8,
 }
 
 #[error_code]

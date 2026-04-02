@@ -18,6 +18,11 @@ describe("solana_crowdfunding", () => {
     program.programId
   );
 
+  const [vaultPDA] = anchor.web3.PublicKey.findProgramAddressSync(
+    [Buffer.from("vault"), campaignPDA.toBuffer()],
+    program.programId
+  );
+
   const [receipt1PDA] = anchor.web3.PublicKey.findProgramAddressSync(
     [Buffer.from("receipt"), campaignPDA.toBuffer(), donor1.publicKey.toBuffer()],
     program.programId
@@ -29,21 +34,20 @@ describe("solana_crowdfunding", () => {
   );
 
   before(async () => {
-    // Beri modal awal untuk donor
+    // Top up donors with SOL
     const sig1 = await provider.connection.requestAirdrop(donor1.publicKey, 2000 * 1e9);
     const sig2 = await provider.connection.requestAirdrop(donor2.publicKey, 2000 * 1e9);
     await provider.connection.confirmTransaction(sig1);
     await provider.connection.confirmTransaction(sig2);
   });
 
-  it("1. Create a campaign with goal=1000 SOL, deadline=tomorrow (simulated 3s)", async () => {
+  it("1. Create a campaign with goal=1000 SOL, deadline=tomorrow (simulated 2s)", async () => {
     const goal = new anchor.BN(1000 * 1e9);
-    // Simulasi 'tomorrow' dengan 3 detik agar bisa di-test tanpa menunggu besok
     const now = Math.floor(Date.now() / 1000);
-    const deadline = new anchor.BN(now + 3); 
+    const deadline = new anchor.BN(now + 2); 
 
     await program.methods.createCampaign(goal, deadline)
-      .accounts({ creator: creator.publicKey })
+      .accounts({ creator: creator.publicKey, campaign: campaignPDA })
       .rpc();
 
     const campaign = await program.account.campaign.fetch(campaignPDA);
@@ -55,28 +59,48 @@ describe("solana_crowdfunding", () => {
     const amount = new anchor.BN(600 * 1e9);
     
     await program.methods.contribute(amount)
-      .accounts({ donor: donor1.publicKey, campaign: campaignPDA, receipt: receipt1PDA })
+      .accounts({ 
+        donor: donor1.publicKey, 
+        campaign: campaignPDA, 
+        vault: vaultPDA,
+        receipt: receipt1PDA 
+      })
       .signers([donor1]).rpc();
 
     const campaign = await program.account.campaign.fetch(campaignPDA);
     expect(campaign.raised.toNumber()).to.equal(600 * 1e9);
+    
+    const vaultBalance = await provider.connection.getBalance(vaultPDA);
+    expect(vaultBalance).to.be.at.least(600 * 1e9);
   });
 
   it("3. Contribute 500 SOL -> should succeed, raised=1100", async () => {
     const amount = new anchor.BN(500 * 1e9);
     
     await program.methods.contribute(amount)
-      .accounts({ donor: donor2.publicKey, campaign: campaignPDA, receipt: receipt2PDA })
+      .accounts({ 
+        donor: donor2.publicKey, 
+        campaign: campaignPDA, 
+        vault: vaultPDA,
+        receipt: receipt2PDA 
+      })
       .signers([donor2]).rpc();
 
     const campaign = await program.account.campaign.fetch(campaignPDA);
     expect(campaign.raised.toNumber()).to.equal(1100 * 1e9);
+
+    const vaultBalance = await provider.connection.getBalance(vaultPDA);
+    expect(vaultBalance).to.be.at.least(1100 * 1e9);
   });
 
   it("4. Try withdraw before deadline -> should fail", async () => {
     try {
       await program.methods.withdraw()
-        .accounts({ creator: creator.publicKey, campaign: campaignPDA }).rpc();
+        .accounts({ 
+          creator: creator.publicKey, 
+          campaign: campaignPDA,
+          vault: vaultPDA 
+        }).rpc();
       expect.fail("Should have failed");
     } catch (e: any) {
       expect(e.error.errorMessage).to.equal("Campaign is still active.");
@@ -84,20 +108,33 @@ describe("solana_crowdfunding", () => {
   });
 
   it("5. Wait until after deadline -> withdraw should succeed", async () => {
-    console.log("      (Waiting 4 seconds to simulate deadline passing...)");
-    await new Promise((resolve) => setTimeout(resolve, 4000));
+    console.log("      (Waiting 3 seconds to simulate deadline passing...)");
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+
+    const creatorBalanceBefore = await provider.connection.getBalance(creator.publicKey);
 
     await program.methods.withdraw()
-      .accounts({ creator: creator.publicKey, campaign: campaignPDA }).rpc();
+      .accounts({ 
+        creator: creator.publicKey, 
+        campaign: campaignPDA,
+        vault: vaultPDA 
+      }).rpc();
 
     const campaign = await program.account.campaign.fetch(campaignPDA);
     expect(campaign.claimed).to.be.true;
+
+    const creatorBalanceAfter = await provider.connection.getBalance(creator.publicKey);
+    expect(creatorBalanceAfter).to.be.greaterThan(creatorBalanceBefore);
   });
 
   it("6. Try withdraw again -> should fail (already claimed)", async () => {
     try {
       await program.methods.withdraw()
-        .accounts({ creator: creator.publicKey, campaign: campaignPDA }).rpc();
+        .accounts({ 
+          creator: creator.publicKey, 
+          campaign: campaignPDA,
+          vault: vaultPDA 
+        }).rpc();
       expect.fail("Should have failed");
     } catch (e: any) {
       expect(e.error.errorMessage).to.equal("Funds already claimed.");
@@ -106,15 +143,21 @@ describe("solana_crowdfunding", () => {
 
   describe("Refund Scenarios (Campaign 2)", () => {
     let campaign2PDA: anchor.web3.PublicKey;
+    let vault2PDA: anchor.web3.PublicKey;
     let receipt1_2PDA: anchor.web3.PublicKey;
 
     it("7. Create a new campaign for refund test (high goal)", async () => {
       const creator2 = anchor.web3.Keypair.generate();
-      const sig = await provider.connection.requestAirdrop(creator2.publicKey, 10 * 10 ** 9);
+      const sig = await provider.connection.requestAirdrop(creator2.publicKey, 10 * 1e9);
       await provider.connection.confirmTransaction(sig);
 
       [campaign2PDA] = anchor.web3.PublicKey.findProgramAddressSync(
         [Buffer.from("campaign"), creator2.publicKey.toBuffer()],
+        program.programId
+      );
+
+      [vault2PDA] = anchor.web3.PublicKey.findProgramAddressSync(
+        [Buffer.from("vault"), campaign2PDA.toBuffer()],
         program.programId
       );
 
@@ -123,19 +166,24 @@ describe("solana_crowdfunding", () => {
         program.programId
       );
 
-      const goal = new anchor.BN(5000 * 10 ** 9);
+      const goal = new anchor.BN(5000 * 1e9);
       const now = Math.floor(Date.now() / 1000);
       const deadline = new anchor.BN(now + 2);
 
       await program.methods.createCampaign(goal, deadline)
-        .accounts({ creator: creator2.publicKey })
+        .accounts({ creator: creator2.publicKey, campaign: campaign2PDA })
         .signers([creator2]).rpc();
     });
 
     it("8. Contribute 100 SOL (not enough for goal)", async () => {
-      const amount = new anchor.BN(100 * 10 ** 9);
+      const amount = new anchor.BN(100 * 1e9);
       await program.methods.contribute(amount)
-        .accounts({ donor: donor1.publicKey, campaign: campaign2PDA, receipt: receipt1_2PDA })
+        .accounts({ 
+          donor: donor1.publicKey, 
+          campaign: campaign2PDA, 
+          vault: vault2PDA,
+          receipt: receipt1_2PDA 
+        })
         .signers([donor1]).rpc();
     });
 
@@ -146,7 +194,12 @@ describe("solana_crowdfunding", () => {
       const donorBalanceBefore = await provider.connection.getBalance(donor1.publicKey);
       
       await program.methods.refund()
-        .accounts({ donor: donor1.publicKey, campaign: campaign2PDA, receipt: receipt1_2PDA })
+        .accounts({ 
+          donor: donor1.publicKey, 
+          campaign: campaign2PDA, 
+          vault: vault2PDA,
+          receipt: receipt1_2PDA 
+        })
         .signers([donor1]).rpc();
 
       const donorBalanceAfter = await provider.connection.getBalance(donor1.publicKey);
@@ -156,5 +209,4 @@ describe("solana_crowdfunding", () => {
       expect(receipt.amount.toNumber()).to.equal(0);
     });
   });
-
 });
